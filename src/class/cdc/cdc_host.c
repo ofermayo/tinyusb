@@ -41,6 +41,21 @@
 // Host CDC Interface
 //--------------------------------------------------------------------+
 
+#if CFG_TUH_CDC_CH341
+typedef struct {
+  uint8_t daddr;
+	uint32_t baud_rate; /* set baud rate */
+	uint8_t mcr;
+	uint8_t msr;
+	uint8_t lcr;
+
+	uint64_t quirks;
+	uint8_t version;
+
+	uint64_t break_end;
+} ch341_private_t;
+#endif
+
 typedef struct {
   uint8_t daddr;
   uint8_t bInterfaceNumber;
@@ -66,6 +81,10 @@ typedef struct {
     uint8_t rx_ff_buf[CFG_TUH_CDC_TX_BUFSIZE];
     CFG_TUH_MEM_ALIGN uint8_t rx_ep_buf[CFG_TUH_CDC_TX_EPSIZE];
   } stream;
+
+  #if CFG_TUH_CDC_CH341
+  ch341_private_t ch341_private;
+  #endif
 
 } cdch_interface_t;
 
@@ -118,6 +137,23 @@ static bool cp210x_set_modem_ctrl(cdch_interface_t* p_cdc, uint16_t line_state, 
 static bool cp210x_set_baudrate(cdch_interface_t* p_cdc, uint32_t baudrate, tuh_xfer_cb_t complete_cb, uintptr_t user_data);
 #endif
 
+//------------- CH341 prototypes -------------//
+#if CFG_TUH_CDC_CH341
+#include "serial/ch341.h"
+
+static uint16_t const ch341_vid_pid_pairs[] = { TU_CH341_VID_PID_PAIRS };
+enum {
+  CH341_VID_PID_PAIR_COUNT = sizeof(ch341_vid_pid_pairs) / sizeof(ch341_vid_pid_pairs[0]) / 2
+};
+
+static bool ch341_open(uint8_t daddr, tusb_desc_interface_t const *itf_desc, uint16_t max_len);
+static void ch341_process_config(tuh_xfer_t* xfer);
+
+static bool ch341_set_modem_ctrl(cdch_interface_t* p_cdc, uint16_t line_state, tuh_xfer_cb_t complete_cb, uintptr_t user_data);
+static bool ch341_set_baudrate(cdch_interface_t* p_cdc, uint32_t baudrate, tuh_xfer_cb_t complete_cb, uintptr_t user_data);
+
+#endif
+
 enum {
   SERIAL_DRIVER_ACM = 0,
 
@@ -127,6 +163,10 @@ enum {
 
 #if CFG_TUH_CDC_CP210X
   SERIAL_DRIVER_CP210X,
+#endif
+
+#if CFG_TUH_CDC_CH341
+  SERIAL_DRIVER_CH341,
 #endif
 };
 
@@ -154,6 +194,13 @@ static const cdch_serial_driver_t serial_drivers[] = {
   { .process_set_config     = cp210x_process_config,
     .set_control_line_state = cp210x_set_modem_ctrl,
     .set_baudrate           = cp210x_set_baudrate
+  },
+  #endif
+
+  #if CFG_TUH_CDC_CH341
+  { .process_set_config     = ch341_process_config,
+    .set_control_line_state = ch341_set_modem_ctrl,
+    .set_baudrate           = ch341_set_baudrate
   },
   #endif
 };
@@ -223,7 +270,12 @@ uint8_t tuh_cdc_itf_get_index(uint8_t daddr, uint8_t itf_num)
   {
     const cdch_interface_t* p_cdc = &cdch_data[i];
 
-    if (p_cdc->daddr == daddr && p_cdc->bInterfaceNumber == itf_num) return i;
+    if (p_cdc->daddr == daddr) {
+      if (p_cdc->bInterfaceNumber == itf_num) return i;
+      #if CFG_TUH_CDC_CH341
+      if (p_cdc->serial_drid == SERIAL_DRIVER_CH341 && p_cdc->bInterfaceNumber == 0) return i;
+      #endif
+    } 
   }
 
   return TUSB_INDEX_INVALID_8;
@@ -421,6 +473,10 @@ static void cdch_internal_control_complete(tuh_xfer_t* xfer)
             break;
         }
         break;
+      #endif
+
+      #if CFG_TUH_CDC_CH341
+      // oferm TODO: add implementation
       #endif
 
       default: break;
@@ -640,7 +696,7 @@ bool cdch_open(uint8_t rhport, uint8_t daddr, tusb_desc_interface_t const *itf_d
   {
     return acm_open(daddr, itf_desc, max_len);
   }
-  #if CFG_TUH_CDC_FTDI || CFG_TUH_CDC_CP210X
+  #if CFG_TUH_CDC_FTDI || CFG_TUH_CDC_CP210X || CFG_TUH_CDC_CH341
   else if ( 0xff == itf_desc->bInterfaceClass )
   {
     uint16_t vid, pid;
@@ -662,6 +718,14 @@ bool cdch_open(uint8_t rhport, uint8_t daddr, tusb_desc_interface_t const *itf_d
         if (cp210x_pids[i] == pid) {
           return cp210x_open(daddr, itf_desc, max_len);
         }
+      }
+    }
+    #endif
+
+    #if CFG_TUH_CDC_CH341
+    for (size_t i = 0; i < CH341_VID_PID_PAIR_COUNT; i++) {
+      if (ch341_vid_pid_pairs[i * 2] == vid && ch341_vid_pid_pairs[i * 2 + 1] == pid) {
+        return ch341_open(daddr, itf_desc, max_len);
       }
     }
     #endif
@@ -1171,6 +1235,313 @@ static void cp210x_process_config(tuh_xfer_t* xfer) {
 
     default: break;
   }
+}
+
+#endif
+
+//--------------------------------------------------------------------+
+// CH341
+//--------------------------------------------------------------------+
+#if CFG_TUH_CDC_CH341
+
+enum {
+  CONFIG_CH341_GET_VERSION = 0,
+  CONFIG_CH341_REQ_SERIAL_INIT,
+  CONFIG_CH341_REQ_WRITE_DIVISOR,
+  CONFIG_CH341_REQ_WRITE_LCR,
+  CONFIG_CH341_SET_HANDSHAKE,
+  CONFIG_CH341_DETECT_QUIRKS,
+  CONFIG_CH341_COMPLETE
+};
+
+/*
+ * The device line speed is given by the following equation:
+ *
+ *	baudrate = 48000000 / (2^(12 - 3 * ps - fact) * div), where
+ *
+ *		0 <= ps <= 3,
+ *		0 <= fact <= 1,
+ *		2 <= div <= 256 if fact = 0, or
+ *		9 <= div <= 256 if fact = 1
+ */
+static bool ch341_get_divisor(uint64_t quirks, uint32_t speed, uint32_t* divisor)
+{
+	uint32_t fact, div, clk_div;
+	bool force_fact0 = false;
+	int32_t ps;
+
+	/*
+	 * Clamp to supported range, this makes the (ps < 0) and (div < 2)
+	 * sanity checks below redundant.
+	 */
+  if (speed > CH341_MAX_BPS) speed = CH341_MAX_BPS;
+  if (speed < CH341_MIN_BPS) speed = CH341_MIN_BPS;
+
+	/*
+	 * Start with highest possible base clock (fact = 1) that will give a
+	 * divisor strictly less than 512.
+	 */
+	fact = 1;
+	for (ps = 3; ps >= 0; ps--) {
+		if (speed > ch341_min_rates[ps])
+			break;
+	}
+
+	if (ps < 0)
+		return false;
+
+	/* Determine corresponding divisor, rounding down. */
+	clk_div = CH341_CLK_DIV(ps, fact);
+	div = CH341_CLKRATE / (clk_div * speed);
+
+	/* Some devices require a lower base clock if ps < 3. */
+	if (ps < 3 && (quirks & CH341_QUIRK_LIMITED_PRESCALER))
+		force_fact0 = true;
+
+	/* Halve base clock (fact = 0) if required. */
+	if (div < 9 || div > 255 || force_fact0) {
+		div /= 2;
+		clk_div *= 2;
+		fact = 0;
+	}
+
+	if (div < 2)
+		return false;
+
+	/*
+	 * Pick next divisor if resulting rate is closer to the requested one,
+	 * scale up to avoid rounding errors on low rates.
+	 */
+	if (16 * CH341_CLKRATE / (clk_div * div) - 16 * speed >=
+			16 * speed - 16 * CH341_CLKRATE / (clk_div * (div + 1)))
+		div++;
+
+	/*
+	 * Prefer lower base clock (fact = 0) if even divisor.
+	 *
+	 * Note that this makes the receiver more tolerant to errors.
+	 */
+	if (fact == 1 && div % 2 == 0) {
+		div /= 2;
+		fact = 0;
+	}
+
+	*divisor = (0x100 - div) << 8 | fact << 2 | ps;
+  return true;
+}
+
+static bool ch341_set_request(cdch_interface_t* p_cdc, uint8_t direction, uint8_t command, uint16_t value, uint16_t index, uint8_t* buffer, uint16_t length, tuh_xfer_cb_t complete_cb, uintptr_t user_data) {
+  tusb_control_request_t const request = {
+    .bmRequestType_bit = {
+      .recipient = TUSB_REQ_RCPT_DEVICE,
+      .type      = TUSB_REQ_TYPE_VENDOR,
+      .direction = direction
+    },
+    .bRequest = command,
+    .wValue   = tu_htole16(value),
+    .wIndex   = tu_htole16(index),
+    .wLength  = tu_htole16(length)
+  };
+
+  // use usbh enum buf since application variable does not live long enough
+  uint8_t* enum_buf = NULL;
+
+  if (buffer && length > 0) {
+    enum_buf = usbh_get_enum_buf();
+    tu_memcpy_s(enum_buf, CFG_TUH_ENUMERATION_BUFSIZE, buffer, length);
+  }
+
+  tuh_xfer_t xfer = {
+    .daddr       = p_cdc->daddr,
+    .ep_addr     = 0,
+    .setup       = &request,
+    .buffer      = enum_buf,
+    .complete_cb = complete_cb,
+    .user_data   = user_data
+  };
+
+  return tuh_control_xfer(&xfer);
+}
+
+static bool ch341_set_request_in(cdch_interface_t* p_cdc, uint8_t command, uint16_t value, uint16_t index, uint8_t* buffer, uint16_t length, tuh_xfer_cb_t complete_cb, uintptr_t user_data) {
+  return ch341_set_request(p_cdc, TUSB_DIR_IN, command, value, index, buffer, length, complete_cb, user_data);
+}
+
+static bool ch341_set_request_out(cdch_interface_t* p_cdc, uint8_t command, uint16_t value, uint16_t index, tuh_xfer_cb_t complete_cb, uintptr_t user_data) {
+  return ch341_set_request(p_cdc, TUSB_DIR_OUT, command, value, index, NULL, 0, complete_cb, user_data);
+}
+
+/* -------------------------------------------------------------------------- */
+
+static bool ch341_read_version(cdch_interface_t* p_cdc, tuh_xfer_cb_t complete_cb, uintptr_t user_data) {
+  uint8_t buffer[2];
+  return ch341_set_request_in(p_cdc, CH341_REQ_READ_VERSION, 0, 0, buffer, 2, complete_cb, user_data);
+}
+
+static bool ch341_request_serial_init(cdch_interface_t* p_cdc, tuh_xfer_cb_t complete_cb, uintptr_t user_data) {
+  return ch341_set_request_out(p_cdc, CH341_REQ_SERIAL_INIT, 0, 0, complete_cb, user_data);
+}
+
+static bool ch341_request_write_divisor(cdch_interface_t* p_cdc, tuh_xfer_cb_t complete_cb, uintptr_t user_data) {
+  uint32_t divisor;
+  bool r = ch341_get_divisor(p_cdc->ch341_private.quirks, p_cdc->ch341_private.baud_rate, &divisor);
+  if (!r) {
+    return r;
+  }
+
+  if (p_cdc->ch341_private.version > 0x27) {
+    divisor |= 1 << 7;
+  }
+
+  p_cdc->user_control_cb = complete_cb;
+  return ch341_set_request_out(p_cdc, CH341_REQ_WRITE_REG, CH341_REG_DIVISOR << 8 | CH341_REG_PRESCALER, divisor,
+    complete_cb ? cdch_internal_control_complete : NULL, user_data);
+}
+
+static bool ch341_request_write_lcr(cdch_interface_t* p_cdc, tuh_xfer_cb_t complete_cb, uintptr_t user_data) {
+  p_cdc->user_control_cb = complete_cb;
+  return ch341_set_request_out(p_cdc, CH341_REQ_WRITE_REG, CH341_REG_LCR2 << 8 | CH341_REG_LCR, p_cdc->ch341_private.lcr,
+    complete_cb ? cdch_internal_control_complete : NULL, user_data);
+}
+
+static bool ch341_request_set_handshake(cdch_interface_t* p_cdc, tuh_xfer_cb_t complete_cb, uintptr_t user_data) {
+  p_cdc->user_control_cb = complete_cb;
+  return ch341_set_request_out(p_cdc, CH341_REQ_MODEM_CTRL, ~p_cdc->ch341_private.mcr, 0,
+    complete_cb ? cdch_internal_control_complete : NULL, user_data);
+}
+
+static bool ch341_open(uint8_t daddr, tusb_desc_interface_t const *itf_desc, uint16_t max_len) {
+  // CH341 interface includes 1 vendor interface + 2 bulk endpoints + 1 interupt endpoint (not handled)
+  TU_VERIFY(itf_desc->bInterfaceSubClass == 0x01 && itf_desc->bInterfaceProtocol == 0x02 && itf_desc->bNumEndpoints == 3);
+  TU_VERIFY(sizeof(tusb_desc_interface_t) + 3 * sizeof(tusb_desc_endpoint_t) <= max_len);
+
+  cdch_interface_t * p_cdc = make_new_itf(daddr, itf_desc);
+  TU_VERIFY(p_cdc);
+  
+  p_cdc->ch341_private.baud_rate = DEFAULT_BAUD_RATE;
+	/*
+	 * Some CH340 devices appear unable to change the initial LCR
+	 * settings, so set a sane 8N1 default.
+	 */
+	p_cdc->ch341_private.lcr = CH341_LCR_ENABLE_RX | CH341_LCR_ENABLE_TX | CH341_LCR_CS8;
+
+  TU_LOG_DRV("CH341 opened\r\n");
+
+  p_cdc->serial_drid = SERIAL_DRIVER_CH341;
+
+  // endpoint pair
+  tusb_desc_endpoint_t const * desc_ep = (tusb_desc_endpoint_t const *) tu_desc_next(itf_desc);
+
+  // data endpoints expected to be in pairs
+  return open_ep_stream_pair(p_cdc, desc_ep);
+}
+
+static void ch341_process_config(tuh_xfer_t* xfer) {
+  uintptr_t const state = xfer->user_data;
+  uint8_t const itf_num = 0;
+  uint8_t const idx = tuh_cdc_itf_get_index(xfer->daddr, itf_num);
+  cdch_interface_t * p_cdc = get_itf(idx);
+  TU_ASSERT(p_cdc, );
+
+  switch (state)
+  {
+  case CONFIG_CH341_GET_VERSION:
+    TU_ASSERT(ch341_read_version(p_cdc, ch341_process_config, CONFIG_CH341_REQ_SERIAL_INIT),);
+    break;
+    
+  case CONFIG_CH341_REQ_SERIAL_INIT:
+    p_cdc->ch341_private.version = xfer->buffer[0];
+    TU_ASSERT(ch341_request_serial_init(p_cdc, ch341_process_config, CONFIG_CH341_REQ_WRITE_DIVISOR),);
+    break;
+
+  case CONFIG_CH341_REQ_WRITE_DIVISOR:
+    TU_ASSERT(ch341_request_write_divisor(p_cdc, ch341_process_config, CONFIG_CH341_REQ_WRITE_LCR),);
+    break;
+  
+  case CONFIG_CH341_REQ_WRITE_LCR:
+    /*
+    * Chip versions before version 0x30 as read using
+    * CH341_REQ_READ_VERSION used separate registers for line control
+    * (stop bits, parity and word length). Version 0x30 and above use
+    * CH341_REG_LCR only and CH341_REG_LCR2 is always set to zero.
+    */
+    if (p_cdc->ch341_private.version >= 0x30) {
+      TU_ASSERT(ch341_request_write_lcr(p_cdc, ch341_process_config, CONFIG_CH341_DETECT_QUIRKS),);
+      break;
+    }
+    else {
+      TU_ATTR_FALLTHROUGH;
+    }
+  
+  case CONFIG_CH341_SET_HANDSHAKE:
+    TU_ASSERT(ch341_request_set_handshake(p_cdc, ch341_process_config, CONFIG_CH341_DETECT_QUIRKS),);
+    break;
+
+  case CONFIG_CH341_DETECT_QUIRKS:
+    /*
+    * A subset of CH34x devices does not support all features. The
+    * prescaler is limited and there is no support for sending a RS232
+    * break condition. A read failure when trying to set up the latter is
+    * used to detect these devices.
+    */
+    // Not implemented, skip for now
+    TU_ATTR_FALLTHROUGH;
+
+  case CONFIG_CH341_COMPLETE:
+    set_config_complete(p_cdc, idx, itf_num);
+    break;
+  
+  default:
+    break;
+  }
+}
+
+static bool ch341_set_modem_ctrl(cdch_interface_t* p_cdc, uint16_t line_state, tuh_xfer_cb_t complete_cb, uintptr_t user_data) {
+  if (line_state && 1) {
+    p_cdc->ch341_private.mcr |= CH341_BIT_DTR;
+  }
+  else {
+    p_cdc->ch341_private.mcr &= ~(CH341_BIT_DTR);
+  }
+
+  if (line_state && 1 << 1) {
+    p_cdc->ch341_private.mcr |= CH341_BIT_DTR;
+  }
+  else {
+    p_cdc->ch341_private.mcr &= ~(CH341_BIT_RTS);
+  }
+
+  p_cdc->user_control_cb = complete_cb;
+  return ch341_request_set_handshake(p_cdc, complete_cb ? cdch_internal_control_complete : NULL, user_data);
+}
+
+static void ch341_process_set_baudrate(tuh_xfer_t* xfer) {
+  uintptr_t const state = xfer->user_data;
+  uint8_t const itf_num = 0;
+  uint8_t const idx = tuh_cdc_itf_get_index(xfer->daddr, itf_num);
+  cdch_interface_t * p_cdc = get_itf(idx);
+  TU_ASSERT(p_cdc, );
+
+  switch (state)
+  {
+    case 0:
+    case CONFIG_CH341_REQ_WRITE_DIVISOR:
+      TU_ASSERT(ch341_request_write_divisor(p_cdc, ch341_process_set_baudrate, CONFIG_CH341_REQ_WRITE_LCR),);
+      break;
+    
+    case CONFIG_CH341_REQ_WRITE_LCR:
+      TU_ASSERT(ch341_request_write_lcr(p_cdc, ch341_process_set_baudrate, CONFIG_CH341_COMPLETE),);
+      break;
+
+    case CONFIG_CH341_COMPLETE:
+    default:
+      break;
+  }
+}
+
+static bool ch341_set_baudrate(cdch_interface_t* p_cdc, uint32_t baudrate, tuh_xfer_cb_t complete_cb, uintptr_t user_data) {
+  p_cdc->ch341_private.baud_rate = baudrate;
+  return ch341_request_write_divisor(p_cdc, ch341_process_set_baudrate, CONFIG_CH341_REQ_WRITE_LCR);
 }
 
 #endif
